@@ -124,7 +124,7 @@ export default function App() {
 
     if (!activeJobId) return;
 
-    const intervalMs = dataSaver ? 25000 : 8000;
+    const intervalMs = dataSaver ? 30000 : 10000;
 
     const poll = () => {
       // Don't poll if browser tab is hidden to save mobile data!
@@ -187,7 +187,6 @@ export default function App() {
 
   const handleDeleteJob = async () => {
     if (!activeJobId) return;
-    if (!confirm('Are you sure you want to delete this translation job?')) return;
     try {
       await fetch(`/api/jobs/${activeJobId}`, { method: 'DELETE' });
       setActiveJobId(null);
@@ -196,7 +195,7 @@ export default function App() {
       setViewMode('upload');
       fetchAllJobs();
     } catch (e) {
-      console.error(e);
+      console.error('Delete job error:', e);
     }
   };
 
@@ -276,7 +275,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-neutral-950 text-neutral-100 flex flex-col font-sans">
+    <div className="min-h-screen bg-[#120d17] text-pink-50 flex flex-col font-sans selection:bg-pink-500/30 selection:text-pink-100">
       {/* App Header */}
       <Header
         apiKeysCount={apiKeys.length}
@@ -294,10 +293,10 @@ export default function App() {
       <main className="max-w-4xl mx-auto w-full px-3 sm:px-6 py-6 flex-1 space-y-6">
         {/* Previous Jobs Selector Bar (if jobs exist) */}
         {allJobs.length > 0 && (
-          <div className="flex items-center justify-between gap-2 p-2.5 rounded-lg bg-neutral-900/60 border border-neutral-800 text-xs overflow-x-auto">
-            <div className="flex items-center gap-1.5 shrink-0 text-neutral-400 font-medium">
-              <History className="w-3.5 h-3.5 text-emerald-400" />
-              <span>Novels:</span>
+          <div className="flex items-center justify-between gap-2 p-2 sm:p-2.5 rounded-2xl bg-[#19131d]/90 border border-pink-900/30 text-xs overflow-x-auto shadow-sm">
+            <div className="flex items-center gap-1.5 shrink-0 text-pink-300/80 font-medium">
+              <span className="text-sm">🌸</span>
+              <span className="font-semibold">Novels:</span>
             </div>
 
             <div className="flex items-center gap-1.5 overflow-x-auto">
@@ -312,14 +311,14 @@ export default function App() {
                       setViewMode('dashboard');
                       fetchStatus(j.id);
                     }}
-                    className={`px-2.5 py-1 rounded-md text-xs font-medium whitespace-nowrap transition-colors flex items-center gap-1.5 ${
+                    className={`px-3 py-1.5 rounded-xl text-xs font-medium whitespace-nowrap transition-all flex items-center gap-1.5 cursor-pointer ${
                       isSelected
-                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800 font-semibold'
-                        : 'bg-neutral-950/80 text-neutral-400 hover:text-neutral-200 border border-neutral-800/80'
+                        ? 'bg-gradient-to-r from-pink-950 to-purple-950 text-pink-200 border border-pink-500/60 font-semibold shadow-xs'
+                        : 'bg-[#120d17]/80 text-pink-300/70 hover:text-pink-100 border border-pink-900/40 hover:border-pink-500/30'
                     }`}
                   >
-                    <span className="truncate max-w-[120px]">{j.title}</span>
-                    <span className="text-[10px] font-mono text-neutral-500">
+                    <span className="truncate max-w-[130px]">{j.title}</span>
+                    <span className="text-[10px] font-mono text-pink-400/60">
                       ({j.completedChapters}/{j.totalChapters})
                     </span>
                   </button>
@@ -329,9 +328,9 @@ export default function App() {
 
             <button
               onClick={() => setViewMode('upload')}
-              className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-neutral-800 hover:bg-neutral-700 text-neutral-200 whitespace-nowrap shrink-0 transition-colors"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-pink-500/20 hover:bg-pink-500/30 text-pink-200 border border-pink-500/40 whitespace-nowrap shrink-0 transition-colors cursor-pointer"
             >
-              <PlusCircle className="w-3.5 h-3.5" />
+              <PlusCircle className="w-3.5 h-3.5 text-pink-400" />
               <span>New</span>
             </button>
           </div>
@@ -358,21 +357,22 @@ export default function App() {
             isRefreshing={isRefreshing}
           />
         ) : (
-          <div className="text-center py-16 space-y-3">
-            <p className="text-xs font-mono text-neutral-500">No active job selected.</p>
+          <div className="text-center py-16 space-y-4">
+            <div className="text-3xl">🌸</div>
+            <p className="text-xs font-mono text-pink-300/60">No active novel selected.</p>
             <button
               onClick={() => setViewMode('upload')}
-              className="px-4 py-2 rounded-lg bg-emerald-500 text-neutral-950 font-bold text-xs"
+              className="px-5 py-2.5 rounded-2xl bg-gradient-to-r from-pink-500 to-rose-500 text-white font-bold text-xs shadow-lg shadow-pink-500/20 cursor-pointer"
             >
-              Upload a Novel
+              Translate a Novel ✨
             </button>
           </div>
         )}
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-neutral-900 py-4 text-center text-xs text-neutral-500 font-mono">
-        <p>MegaTXT Lite • Cloud Background Worker • Safe Fallback • Zero Data Waste</p>
+      <footer className="border-t border-pink-900/20 py-4 text-center text-xs text-pink-300/50 font-mono">
+        <p>MegaTXT Lite 🌸 Cloud Background Worker • Continuous Subchunking • Zero Data Waste</p>
       </footer>
 
       {/* Modals */}

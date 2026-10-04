@@ -16,6 +16,7 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
   const [config, setConfig] = useState(getStoredTelegramConfig());
   const [testing, setTesting] = useState(false);
   const [testStatus, setTestStatus] = useState<'idle' | 'success' | 'error'>('idle');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -27,11 +28,12 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
 
   const handleTest = async () => {
     if (!config.botToken || !config.chatId) {
-      alert('Please fill in both Bot Token and Chat ID');
+      setErrorMessage('Please fill in both Bot Token and Chat ID 🌸');
       return;
     }
     setTesting(true);
     setTestStatus('idle');
+    setErrorMessage(null);
     try {
       const url = `https://api.telegram.org/bot${config.botToken}/sendMessage`;
       const res = await fetch(url, {
@@ -47,9 +49,11 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
         setTestStatus('success');
       } else {
         setTestStatus('error');
+        setErrorMessage('Failed to send test message. Please verify Bot Token and Chat ID.');
       }
     } catch {
       setTestStatus('error');
+      setErrorMessage('Connection failed. Please check network or Telegram credentials.');
     } finally {
       setTesting(false);
     }
@@ -119,7 +123,15 @@ export const TelegramModal: React.FC<TelegramModalProps> = ({
 
           {testStatus === 'error' && (
             <p className="text-xs text-rose-400 flex items-center gap-1 font-mono">
-              <AlertCircle className="w-3.5 h-3.5" /> Could not send test message. Check token & chat ID.
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>{errorMessage || 'Could not send test message. Check token & chat ID.'}</span>
+            </p>
+          )}
+
+          {errorMessage && testStatus !== 'error' && (
+            <p className="text-xs text-rose-400 flex items-center gap-1 font-mono">
+              <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+              <span>{errorMessage}</span>
             </p>
           )}
         </div>

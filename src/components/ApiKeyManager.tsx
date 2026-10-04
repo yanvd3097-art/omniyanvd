@@ -30,6 +30,7 @@ export const ApiKeyManager: React.FC<ApiKeyManagerProps> = ({
   const [showBulk, setShowBulk] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResults, setTestResults] = useState<KeyTestResult[] | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
@@ -63,12 +64,13 @@ export const ApiKeyManager: React.FC<ApiKeyManagerProps> = ({
   const handleTestKeys = async () => {
     const validCandidates = keyInputList.map(k => k.trim()).filter(Boolean);
     if (validCandidates.length === 0) {
-      alert('Please enter at least one API key to test.');
+      setTestError('Please enter at least one API key to test 🌸');
       return;
     }
 
     setTesting(true);
     setTestResults(null);
+    setTestError(null);
     try {
       const res = await fetch('/api/test-keys', {
         method: 'POST',
@@ -78,9 +80,11 @@ export const ApiKeyManager: React.FC<ApiKeyManagerProps> = ({
       const data = await res.json();
       if (data.success) {
         setTestResults(data.results);
+      } else {
+        setTestError(data.error || 'Failed to test keys');
       }
     } catch (e: any) {
-      alert('Key test failed: ' + e.message);
+      setTestError('Key test failed: ' + (e?.message || 'Network error'));
     } finally {
       setTesting(false);
     }
@@ -218,6 +222,14 @@ export const ApiKeyManager: React.FC<ApiKeyManagerProps> = ({
                 <Plus className="w-3.5 h-3.5" />
                 <span>Add another key slot</span>
               </button>
+            </div>
+          )}
+
+          {/* Test Error Message */}
+          {testError && (
+            <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-800 text-xs text-rose-200 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
+              <span>{testError}</span>
             </div>
           )}
         </div>

@@ -1,15 +1,39 @@
-export interface Chapter {
+export interface TranslationChunk {
+  id: string; // e.g. "ch_53_sub_0"
+  jobId: string;
+  parentChapterId: string;
+  parentChapterIndex: number;
+  parentChapterTitle: string;
+  subChunkIndex: number;
+  sourceText: string;
+  sourceCharStart: number;
+  sourceCharEnd: number;
+  status: 'pending' | 'translating' | 'completed' | 'failed' | 'fallback_google';
+  englishText: string;
+  translatedWordCount: number;
+  translatorUsed: 'gemini' | 'google_translate';
+  fallbackReason?: string;
+  error?: string;
+  leaseWorkerId?: string;
+  leaseTimestamp?: number;
+  completedAt?: number;
+  updatedAt: number;
+}
+
+export interface ParentChapter {
+  id: string; // e.g. "ch_53"
+  jobId: string;
   index: number;
   title: string;
-  originalText: string;
-  translatedText?: string;
-  status: 'pending' | 'translating' | 'completed' | 'failed' | 'fallback_google';
-  translatorUsed?: 'gemini' | 'google_translate';
+  originalText?: string; // Stored server-side only
   originalWordCount: number;
+  subChunkCount: number;
+  subChunkIds: string[];
+  status: 'pending' | 'translating' | 'completed' | 'failed' | 'fallback_google';
   translatedWordCount: number;
-  error?: string;
+  translatorUsed?: string;
   fallbackReason?: string;
-  completedAt?: number;
+  error?: string;
 }
 
 export interface TranslationJob {
@@ -23,18 +47,24 @@ export interface TranslationJob {
   updatedAt: number;
   totalChapters: number;
   completedChapters: number;
+  contiguousCompletedChapters: number;
+  totalChunks: number;
+  completedChunks: number;
   totalOriginalWords: number;
   translatedWords: number;
   activeKeyIndex: number;
   apiKeys: string[];
   glossary: Record<string, string>;
-  chapters: Chapter[];
+  targetChunkChars: number;
+  contentHash: string;
+  currentChapterIndex?: number;
+  currentChapterTitle?: string;
+  lastError?: string;
   telegramConfig?: {
     botToken: string;
     chatId: string;
     enabled: boolean;
   };
-  lastError?: string;
 }
 
 export interface JobStatusSummary {
@@ -45,6 +75,9 @@ export interface JobStatusSummary {
   targetLang: string;
   totalChapters: number;
   completedChapters: number;
+  contiguousCompletedChapters: number;
+  totalChunks: number;
+  completedChunks: number;
   totalOriginalWords: number;
   translatedWords: number;
   activeKeyIndex: number;
@@ -56,4 +89,25 @@ export interface JobStatusSummary {
   lastError?: string;
   readyForEpub: boolean;
   sensitiveChaptersCount: number;
+}
+
+export interface ChapterSummaryHeader {
+  index: number;
+  title: string;
+  wordCount: number;
+  subChunkCount: number;
+  preview: string;
+}
+
+export interface ChapterDetailHeader {
+  index: number;
+  title: string;
+  status: string;
+  subChunkCount: number;
+  completedSubChunks: number;
+  originalWordCount: number;
+  translatedWordCount: number;
+  translatorUsed?: string;
+  fallbackReason?: string;
+  error?: string;
 }

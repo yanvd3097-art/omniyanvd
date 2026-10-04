@@ -1,0 +1,57 @@
+{
+  "entities": {
+    "TranslationJob": {
+      "title": "TranslationJob",
+      "description": "Represents a novel translation job",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "title": { "type": "string" },
+        "sourceLang": { "type": "string" },
+        "targetLang": { "type": "string" },
+        "model": { "type": "string" },
+        "status": { "type": "string", "enum": ["idle", "running", "paused", "completed", "error"] },
+        "totalChapters": { "type": "number" },
+        "completedChapters": { "type": "number" },
+        "totalOriginalWords": { "type": "number" },
+        "translatedWords": { "type": "number" },
+        "activeKeyIndex": { "type": "number" },
+        "totalKeys": { "type": "number" },
+        "createdAt": { "type": "number" },
+        "updatedAt": { "type": "number" },
+        "contentHash": { "type": "string" }
+      },
+      "required": ["id", "title", "status", "totalChapters", "completedChapters"]
+    },
+    "TranslationChunk": {
+      "title": "TranslationChunk",
+      "description": "Represents an internal subchunk of a chapter",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "jobId": { "type": "string" },
+        "parentChapterId": { "type": "string" },
+        "parentChapterIndex": { "type": "number" },
+        "parentChapterTitle": { "type": "string" },
+        "subChunkIndex": { "type": "number" },
+        "sourceText": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "translating", "completed", "failed", "fallback_google"] },
+        "englishText": { "type": "string" },
+        "translatedWordCount": { "type": "number" },
+        "translatorUsed": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "jobId", "parentChapterIndex", "subChunkIndex", "status"]
+    }
+  },
+  "firestore": {
+    "/translation_jobs/{jobId}": {
+      "schema": "TranslationJob",
+      "description": "Durable translation jobs"
+    },
+    "/translation_jobs/{jobId}/chunks/{chunkId}": {
+      "schema": "TranslationChunk",
+      "description": "Durable chapter subchunks"
+    }
+  }
+}

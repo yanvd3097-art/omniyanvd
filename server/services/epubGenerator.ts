@@ -1,5 +1,5 @@
 import JSZip from 'jszip';
-import { Chapter, TranslationJob } from '../types.js';
+import { ParentChapter, TranslationChunk, TranslationJob } from '../types.js';
 
 function escapeXml(unsafe: string): string {
   if (!unsafe) return '';
@@ -13,8 +13,7 @@ function escapeXml(unsafe: string): string {
 
 export function formatChapterHtml(title: string, content: string, index: number): string {
   const safeTitle = escapeXml(title || `Chapter ${index}`);
-  
-  // Format paragraphs into clean XHTML <p> tags
+
   const rawParagraphs = content.split(/\n+/).map(p => p.trim()).filter(Boolean);
   const paragraphElements = rawParagraphs
     .map(p => `  <p class="chapter-para">${escapeXml(p)}</p>`)
@@ -37,13 +36,89 @@ ${paragraphElements}
 </html>`;
 }
 
+export interface MergedExportChapter {
+  index: number;
+  title: string;
+  mergedText: string;
+}
+
+/**
+ * Merges internal subchunks in exact sequence (0, 1, 2...) into 1 final exported chapter per parent chapter.
+ * Enforces NEVER-SKIP contiguous progress: stops strictly at the first incomplete chapter!
+ */
+export function getContiguousCompletedChapters(
+  chapters: ParentChapter[],
+  chunks: TranslationChunk[],
+  partial: boolean = true
+): MergedExportChapter[] {
+  // Sort chapters strictly by index (1, 2, 3...)
+  const sortedChapters = [...chapters].sort((a, b) => a.index - b.index);
+
+  // Group chunks by parentChapterId
+  const chunksByParent = new Map<string, TranslationChunk[]>();
+  for (const chunk of chunks) {
+    const list = chunksByParent.get(chunk.parentChapterId) || [];
+    list.push(chunk);
+    chunksByParent.set(chunk.parentChapterId, list);
+  }
+
+  const exportableChapters: MergedExportChapter[] = [];
+
+  for (const ch of sortedChapters) {
+    const chChunks = (chunksByParent.get(ch.id) || []).sort(
+      (a, b) => a.subChunkIndex - b.subChunkIndex
+    );
+
+    // Verify all subchunks of this chapter are completed
+    const allSubchunksCompleted =
+      chChunks.length > 0 &&
+      chChunks.length === ch.subChunkCount &&
+      chChunks.every(
+        c => c.status === 'completed' || c.status === 'fallback_google'
+      );
+
+    if (allSubchunksCompleted) {
+      // Merge subchunks in exact index order (0, 1, 2...)
+      const mergedText = chChunks
+        .map(c => c.englishText || c.sourceText)
+        .join('\n\n');
+
+      exportableChapters.push({
+        index: ch.index,
+        title: ch.title,
+        mergedText,
+      });
+    } else {
+      if (partial) {
+        // STRICT NEVER-SKIP RULE (Requirement 12):
+        // If chapter 4 is incomplete, partial download stops at 1, 2, 3.
+        // It must NEVER skip chapter 4 and include 5 or 6!
+        break;
+      }
+    }
+  }
+
+  return exportableChapters;
+}
+
+/**
+ * Builds valid, standards-compliant EPUB2/3 Buffer.
+ */
 export async function generateEpubBuffer(
   job: TranslationJob,
-  options: { onlyCompleted?: boolean } = { onlyCompleted: true }
+  chapters: ParentChapter[],
+  chunks: TranslationChunk[],
+  options: { partial?: boolean } = { partial: true }
 ): Promise<Buffer> {
+  const exportChapters = getContiguousCompletedChapters(
+    chapters,
+    chunks,
+    options.partial !== false
+  );
+
   const zip = new JSZip();
 
-  // 1. mimetype: MUST be stored uncompressed as the first entry
+  // 1. mimetype MUST be first, uncompressed (STORE)
   zip.file('mimetype', 'application/epub+zip', { compression: 'STORE' });
 
   // 2. META-INF/container.xml
@@ -55,20 +130,9 @@ export async function generateEpubBuffer(
 </container>`;
   zip.folder('META-INF')!.file('container.xml', containerXml);
 
-  // 3. Filter and strictly sort chapters by chapter.index
-  let chaptersToInclude = job.chapters;
-  if (options.onlyCompleted) {
-    chaptersToInclude = job.chapters.filter(
-      c => c.status === 'completed' || c.status === 'fallback_google'
-    );
-  }
-
-  // Strict ascending numerical sort to ensure chapter order is NEVER jumbled
-  chaptersToInclude = [...chaptersToInclude].sort((a, b) => a.index - b.index);
-
   const oebps = zip.folder('OEBPS')!;
 
-  // 4. CSS
+  // 3. CSS
   const css = `
 @charset "utf-8";
 body {
@@ -111,7 +175,7 @@ p.chapter-para {
 `;
   oebps.file('style.css', css);
 
-  // Title page
+  // 4. Title page
   const safeBookTitle = escapeXml(job.title || 'Translated Novel');
   const titlePageHtml = `<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -125,14 +189,14 @@ p.chapter-para {
   <div class="title-page">
     <h1 class="book-title">${safeBookTitle}</h1>
     <p class="book-meta">Translated with MegaTXT Lite</p>
-    <p class="book-meta">Target: ${escapeXml(job.targetLang)} | Chapters: ${chaptersToInclude.length}</p>
+    <p class="book-meta">Target: ${escapeXml(job.targetLang)} | Chapters: ${exportChapters.length}</p>
     <p class="book-meta">Generated: ${new Date().toLocaleDateString()}</p>
   </div>
 </body>
 </html>`;
   oebps.file('titlepage.xhtml', titlePageHtml);
 
-  // Manifest items & spine items
+  // Manifest & Spine
   const manifestItems: string[] = [
     `<item id="style" href="style.css" media-type="text/css"/>`,
     `<item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>`,
@@ -148,14 +212,13 @@ p.chapter-para {
   const tocNavPoints: string[] = [];
   const tocListItems: string[] = [];
 
-  // Write chapter XHTML files
-  chaptersToInclude.forEach((ch, idx) => {
+  // Write merged chapter XHTML files in strict order
+  exportChapters.forEach((ch, idx) => {
     const fileId = `chapter_${String(ch.index).padStart(4, '0')}`;
     const fileName = `${fileId}.xhtml`;
-    const chapterText = ch.translatedText || ch.originalText || '';
     const chapterTitle = ch.title || `Chapter ${ch.index}`;
 
-    const xhtmlContent = formatChapterHtml(chapterTitle, chapterText, ch.index);
+    const xhtmlContent = formatChapterHtml(chapterTitle, ch.mergedText, ch.index);
     oebps.file(fileName, xhtmlContent);
 
     manifestItems.push(`<item id="${fileId}" href="${fileName}" media-type="application/xhtml+xml"/>`);
@@ -191,7 +254,7 @@ ${tocListItems.join('\n')}
 </html>`;
   oebps.file('toc.xhtml', tocXhtml);
 
-  // Table of Contents NCX (EPUB2 compatibility for Kindle / e-readers)
+  // Table of Contents NCX (EPUB2 compatibility)
   const tocNcx = `<?xml version="1.0" encoding="UTF-8"?>
 <ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
   <head>
@@ -234,4 +297,27 @@ ${spineItems.map(item => '    ' + item).join('\n')}
   });
 
   return buffer;
+}
+
+/**
+ * Builds cumulative contiguous plain text output.
+ */
+export function generateTxtBuffer(
+  job: TranslationJob,
+  chapters: ParentChapter[],
+  chunks: TranslationChunk[],
+  options: { partial?: boolean } = { partial: true }
+): string {
+  const exportChapters = getContiguousCompletedChapters(
+    chapters,
+    chunks,
+    options.partial !== false
+  );
+
+  const parts: string[] = [job.title, `Translated with MegaTXT Lite\n\n`];
+  for (const ch of exportChapters) {
+    parts.push(`=== ${ch.title} ===\n\n${ch.mergedText}\n\n`);
+  }
+
+  return parts.join('\n');
 }

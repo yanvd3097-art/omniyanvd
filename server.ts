@@ -1,7 +1,6 @@
 import express, { Request, Response } from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
-import { splitTextIntoChapters, countWords } from './server/services/textSplitter.js';
 import { jobManager } from './server/services/jobManager.js';
 import { GoogleGenAI } from '@google/genai';
 
@@ -10,134 +9,152 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
-// Enable large text uploads up to 50MB (novels can be large .txt files)
+// Enable large text uploads up to 50MB for raw novels
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Compress responses for mobile data saving if client supports gzip/deflate
+// Default cache control
 app.use((req, res, next) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   next();
 });
 
-// 1. Text Parsing & Chapter Detection API
+/**
+ * 1. Upload & Prepare Novel API
+ * Requirement 5: NEVER return rawChapters or full novel text back to the browser!
+ */
 app.post('/api/parse-text', (req: Request, res: Response) => {
   try {
-    const { text, title } = req.body;
+    const { text, title, targetChunkChars } = req.body;
     if (!text || typeof text !== 'string') {
-      res.status(400).json({ error: 'Text content is required' });
+      res.status(400).json({ error: 'Novel text content is required' });
       return;
     }
 
-    const chapters = splitTextIntoChapters(text, title || 'Uploaded Novel');
-    const totalWords = chapters.reduce((acc, c) => acc + c.originalWordCount, 0);
-
-    // Return chapter summaries without repeating the full text to save bandwidth
-    const summaries = chapters.map(c => ({
-      index: c.index,
-      title: c.title,
-      wordCount: c.originalWordCount,
-      preview: c.originalText.slice(0, 150).replace(/\n+/g, ' ') + '...',
-    }));
+    const prepared = jobManager.prepareNovel(
+      text,
+      title || 'Uploaded Novel',
+      targetChunkChars ? parseInt(targetChunkChars, 10) : 2500
+    );
 
     res.json({
       success: true,
-      totalChapters: chapters.length,
-      totalWords,
-      chapters: summaries,
-      rawChapters: chapters,
+      prepareId: prepared.prepareId,
+      title: prepared.title,
+      totalChapters: prepared.totalChapters,
+      totalOriginalWords: prepared.totalOriginalWords,
+      chapters: prepared.chapters, // Lightweight headers only!
     });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to parse text' });
+    res.status(500).json({ error: err.message || 'Failed to prepare novel' });
   }
 });
 
-// 2. Create and Start Translation Job
-app.post('/api/jobs', (req: Request, res: Response) => {
+/**
+ * 2. Create Translation Job API
+ * Takes prepareId, persists directly to Firestore, begins cloud translation.
+ */
+app.post('/api/jobs', async (req: Request, res: Response) => {
   try {
     const {
+      prepareId,
       title,
-      chapters,
       sourceLang,
       targetLang,
       model,
       apiKeys,
       glossary,
+      targetChunkChars,
       telegramConfig,
       autoStart,
     } = req.body;
 
-    if (!chapters || !Array.isArray(chapters) || chapters.length === 0) {
-      res.status(400).json({ error: 'At least one chapter is required' });
+    if (!prepareId) {
+      res.status(400).json({ error: 'prepareId is required' });
       return;
     }
 
-    const job = jobManager.createJob({
-      title: title || 'Untitled Novel',
-      chapters,
-      sourceLang: sourceLang || 'auto',
-      targetLang: targetLang || 'en',
+    const job = await jobManager.createJob({
+      prepareId,
+      title,
+      sourceLang: sourceLang || 'Chinese',
+      targetLang: targetLang || 'English',
       model: model || 'gemini-3.8-flash',
       apiKeys: Array.isArray(apiKeys) ? apiKeys : [],
       glossary: glossary || {},
+      targetChunkChars: targetChunkChars ? parseInt(targetChunkChars, 10) : 2500,
       telegramConfig,
+      autoStart: autoStart !== false,
     });
-
-    if (autoStart !== false) {
-      jobManager.startJob(job.id);
-    }
 
     const summary = jobManager.getJobStatusSummary(job.id);
     res.json({ success: true, job: summary });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to create job' });
+    res.status(500).json({ error: err.message || 'Failed to create translation job' });
   }
 });
 
-// 3. List all jobs summary (Data-saving lightweight list)
-app.get('/api/jobs', (req: Request, res: Response) => {
+/**
+ * 3. List all jobs summary (Data-saving lightweight list)
+ */
+app.get('/api/jobs', async (req: Request, res: Response) => {
   try {
-    const jobs = jobManager.getAllJobs();
-    const summaries = jobs.map(j => jobManager.getJobStatusSummary(j.id));
+    const jobs = await jobManager.getAllJobs();
+    const summaries = jobs.map(j => jobManager.getJobStatusSummary(j.id)).filter(Boolean);
     res.json({ success: true, jobs: summaries });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to get jobs' });
   }
 });
 
-// 4. Ultra lightweight single job status (~200 bytes)
-app.get('/api/jobs/:id/status', (req: Request, res: Response) => {
+/**
+ * 4. Lightweight status endpoint (~250-400 bytes)
+ * Supports ETag / 304 Not Modified for maximum mobile data saving!
+ * Also handles GET /api/cloud-job/status?jobId=...&summary=true
+ */
+const handleStatusRequest = (req: Request, res: Response) => {
   try {
-    const summary = jobManager.getJobStatusSummary(req.params.id);
+    const jobId = (req.params.id || req.query.jobId) as string;
+    if (!jobId) {
+      res.status(400).json({ error: 'jobId is required' });
+      return;
+    }
+
+    const summary = jobManager.getJobStatusSummary(jobId);
     if (!summary) {
       res.status(404).json({ error: 'Job not found' });
       return;
     }
+
+    // ETag caching for zero mobile data consumption on unchanged status
+    const etag = `W/"${summary.id}-${summary.updatedAt}-${summary.completedChunks}"`;
+    if (req.headers['if-none-match'] === etag) {
+      res.status(304).end();
+      return;
+    }
+
+    res.setHeader('ETag', etag);
     res.json({ success: true, status: summary });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to get status' });
   }
-});
+};
 
-// 5. Job details (chapter index & status only, no full text, data saving)
-app.get('/api/jobs/:id/details', (req: Request, res: Response) => {
+app.get('/api/jobs/:id/status', handleStatusRequest);
+app.get('/api/cloud-job/status', handleStatusRequest);
+
+/**
+ * 5. Job chapter list details (metadata headers only, NO full text)
+ */
+app.get('/api/jobs/:id/details', async (req: Request, res: Response) => {
   try {
-    const job = jobManager.getJob(req.params.id);
+    const job = await jobManager.getJob(req.params.id);
     if (!job) {
       res.status(404).json({ error: 'Job not found' });
       return;
     }
 
-    const chapterList = job.chapters.map(c => ({
-      index: c.index,
-      title: c.title,
-      status: c.status,
-      translatorUsed: c.translatorUsed,
-      originalWordCount: c.originalWordCount,
-      translatedWordCount: c.translatedWordCount,
-      fallbackReason: c.fallbackReason,
-      error: c.error,
-    }));
+    const chapterHeaders = await jobManager.getChapterHeaders(req.params.id);
 
     res.json({
       success: true,
@@ -150,6 +167,9 @@ app.get('/api/jobs/:id/details', (req: Request, res: Response) => {
         model: job.model,
         totalChapters: job.totalChapters,
         completedChapters: job.completedChapters,
+        contiguousCompletedChapters: job.contiguousCompletedChapters,
+        totalChunks: job.totalChunks,
+        completedChunks: job.completedChunks,
         totalOriginalWords: job.totalOriginalWords,
         translatedWords: job.translatedWords,
         activeKeyIndex: job.activeKeyIndex,
@@ -157,7 +177,7 @@ app.get('/api/jobs/:id/details', (req: Request, res: Response) => {
         hasEnvKey: !!process.env.GEMINI_API_KEY,
         createdAt: job.createdAt,
         updatedAt: job.updatedAt,
-        chapters: chapterList,
+        chapters: chapterHeaders,
         glossary: job.glossary,
         telegramConfig: job.telegramConfig,
       },
@@ -167,19 +187,23 @@ app.get('/api/jobs/:id/details', (req: Request, res: Response) => {
   }
 });
 
-// 6. Single chapter text (lazy loaded on demand for reader)
-app.get('/api/jobs/:id/chapter/:index', (req: Request, res: Response) => {
+/**
+ * 6. Lazy-loaded Reader Chapter (Returns text for ONE chapter only)
+ * Also handles GET /api/cloud-job/chapter/{chapterIndex}?jobId=...
+ */
+const handleChapterRequest = async (req: Request, res: Response) => {
   try {
-    const job = jobManager.getJob(req.params.id);
-    if (!job) {
-      res.status(404).json({ error: 'Job not found' });
+    const jobId = (req.params.id || req.query.jobId) as string;
+    const index = parseInt(req.params.index, 10);
+
+    if (!jobId || isNaN(index)) {
+      res.status(400).json({ error: 'jobId and chapter index are required' });
       return;
     }
 
-    const index = parseInt(req.params.index, 10);
-    const chapter = job.chapters.find(c => c.index === index);
+    const chapter = await jobManager.getMergedChapter(jobId, index);
     if (!chapter) {
-      res.status(404).json({ error: 'Chapter not found' });
+      res.status(404).json({ error: `Chapter ${index} not found` });
       return;
     }
 
@@ -187,12 +211,17 @@ app.get('/api/jobs/:id/chapter/:index', (req: Request, res: Response) => {
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to load chapter' });
   }
-});
+};
 
-// 7. Start / Resume Job
-app.post('/api/jobs/:id/start', (req: Request, res: Response) => {
+app.get('/api/jobs/:id/chapter/:index', handleChapterRequest);
+app.get('/api/cloud-job/chapter/:index', handleChapterRequest);
+
+/**
+ * 7. Start / Resume Job API
+ */
+app.post('/api/jobs/:id/start', async (req: Request, res: Response) => {
   try {
-    const ok = jobManager.startJob(req.params.id);
+    const ok = await jobManager.startJob(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'Job not found' });
       return;
@@ -204,10 +233,12 @@ app.post('/api/jobs/:id/start', (req: Request, res: Response) => {
   }
 });
 
-// 8. Pause Job
-app.post('/api/jobs/:id/pause', (req: Request, res: Response) => {
+/**
+ * 8. Pause Job API
+ */
+app.post('/api/jobs/:id/pause', async (req: Request, res: Response) => {
   try {
-    const ok = jobManager.pauseJob(req.params.id);
+    const ok = await jobManager.pauseJob(req.params.id);
     if (!ok) {
       res.status(404).json({ error: 'Job not found' });
       return;
@@ -219,36 +250,42 @@ app.post('/api/jobs/:id/pause', (req: Request, res: Response) => {
   }
 });
 
-// 9. Delete Job
-app.delete('/api/jobs/:id', (req: Request, res: Response) => {
+/**
+ * 9. Delete Job API
+ */
+app.delete('/api/jobs/:id', async (req: Request, res: Response) => {
   try {
-    const ok = jobManager.deleteJob(req.params.id);
+    const ok = await jobManager.deleteJob(req.params.id);
     res.json({ success: ok });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to delete job' });
   }
 });
 
-// 10. Update API Keys for Job
-app.post('/api/jobs/:id/keys', (req: Request, res: Response) => {
+/**
+ * 10. Update API Keys for Job
+ */
+app.post('/api/jobs/:id/keys', async (req: Request, res: Response) => {
   try {
     const { keys } = req.body;
     if (!Array.isArray(keys)) {
       res.status(400).json({ error: 'Keys array required' });
       return;
     }
-    const ok = jobManager.updateJobKeys(req.params.id, keys);
+    const ok = await jobManager.updateJobKeys(req.params.id, keys);
     res.json({ success: ok });
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to update keys' });
   }
 });
 
-// 11. Live EPUB Download (Does NOT interrupt translation!)
+/**
+ * 11. Live EPUB Download (Contiguous Never-Skip output, does NOT stop background translation)
+ */
 app.get('/api/jobs/:id/download/epub', async (req: Request, res: Response) => {
   try {
     const partial = req.query.partial !== 'false';
-    const job = jobManager.getJob(req.params.id);
+    const job = await jobManager.getJob(req.params.id);
     if (!job) {
       res.status(404).send('Job not found');
       return;
@@ -261,7 +298,9 @@ app.get('/api/jobs/:id/download/epub', async (req: Request, res: Response) => {
     }
 
     const sanitizedTitle = (job.title || 'novel').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
-    const suffix = partial ? `_part_${job.completedChapters}ch` : '_full';
+    const suffix = partial
+      ? `_ch1-${job.contiguousCompletedChapters || job.completedChapters}`
+      : '_full';
     const filename = `${sanitizedTitle}${suffix}.epub`;
 
     res.setHeader('Content-Type', 'application/epub+zip');
@@ -273,24 +312,28 @@ app.get('/api/jobs/:id/download/epub', async (req: Request, res: Response) => {
   }
 });
 
-// 12. TXT Download
-app.get('/api/jobs/:id/download/txt', (req: Request, res: Response) => {
+/**
+ * 12. TXT Download
+ */
+app.get('/api/jobs/:id/download/txt', async (req: Request, res: Response) => {
   try {
     const partial = req.query.partial !== 'false';
-    const job = jobManager.getJob(req.params.id);
+    const job = await jobManager.getJob(req.params.id);
     if (!job) {
       res.status(404).send('Job not found');
       return;
     }
 
-    const txtContent = jobManager.generateTxt(job.id, partial);
+    const txtContent = await jobManager.generateTxt(job.id, partial);
     if (!txtContent) {
       res.status(500).send('Failed to export TXT');
       return;
     }
 
     const sanitizedTitle = (job.title || 'novel').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
-    const suffix = partial ? `_part_${job.completedChapters}ch` : '_full';
+    const suffix = partial
+      ? `_ch1-${job.contiguousCompletedChapters || job.completedChapters}`
+      : '_full';
     const filename = `${sanitizedTitle}${suffix}.txt`;
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
@@ -301,7 +344,9 @@ app.get('/api/jobs/:id/download/txt', (req: Request, res: Response) => {
   }
 });
 
-// 13. Test API Keys Connectivity
+/**
+ * 13. Test API Keys Connectivity (Zero prompt waste)
+ */
 app.post('/api/test-keys', async (req: Request, res: Response) => {
   try {
     const { keys } = req.body;
@@ -320,7 +365,7 @@ app.post('/api/test-keys', async (req: Request, res: Response) => {
             apiKey: cleanKey,
             httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
           });
-          const response = await ai.models.generateContent({
+          await ai.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: 'ping',
             config: { maxOutputTokens: 5 },
@@ -350,7 +395,7 @@ app.post('/api/test-keys', async (req: Request, res: Response) => {
   }
 });
 
-// Setup Vite middleware for development or static serving for production
+// Setup Vite middleware for dev or static serving for prod
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
     app.use(express.static(path.resolve(process.cwd(), 'dist')));

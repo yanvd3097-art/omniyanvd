@@ -8,9 +8,18 @@ export class SafetyBlockError extends Error {
 }
 
 export class RateLimitError extends Error {
-  constructor(message: string) {
+  public retryDelaySeconds?: number;
+  constructor(message: string, retryDelaySeconds?: number) {
     super(message);
     this.name = 'RateLimitError';
+    this.retryDelaySeconds = retryDelaySeconds;
+  }
+}
+
+export class TruncationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TruncationError';
   }
 }
 
@@ -19,6 +28,7 @@ export interface TranslationOptions {
   sourceLang?: string;
   targetLang?: string;
   glossary?: Record<string, string>;
+  timeoutMs?: number;
 }
 
 export function sanitizeApiKey(key: string): string {
@@ -26,7 +36,13 @@ export function sanitizeApiKey(key: string): string {
   return key.trim();
 }
 
-export async function translateChapterWithGemini(
+/**
+ * Translates a single text chunk with Gemini AI.
+ * Follows strict literary translation instructions.
+ * NEVER uses LOW thinking (explicitly forbidden by Requirement 14).
+ * Validates output for non-truncation, non-empty, and safety blocks.
+ */
+export async function translateChunkWithGemini(
   text: string,
   apiKey: string,
   options: TranslationOptions = {}
@@ -39,6 +55,7 @@ export async function translateChapterWithGemini(
   const model = options.model || 'gemini-3.8-flash';
   const targetLang = options.targetLang || 'English';
   const sourceLang = options.sourceLang || 'the original novel language';
+  const timeoutMs = options.timeoutMs || 45000;
 
   const ai = new GoogleGenAI({
     apiKey: cleanKey,
@@ -55,16 +72,24 @@ export async function translateChapterWithGemini(
     const entries = Object.entries(options.glossary)
       .map(([k, v]) => `- "${k}" -> "${v}"`)
       .join('\n');
-    glossaryPrompt = `\nEnsure strict adherence to these specific novel terms and character names:\n${entries}\n`;
+    glossaryPrompt = `\nStrictly adhere to these specific novel terms and character names:\n${entries}\n`;
   }
 
-  const systemInstruction = `You are a master professional literary translator specializing in web novels, light novels, and literary fiction.
-Translate the provided chapter from ${sourceLang} into natural, immersive, and fluent ${targetLang}.
-Preserve paragraph breaks, dialogue nuances, emotional tone, and literary atmosphere.
-DO NOT summarize or skip paragraphs. Output ONLY the translated story text without any conversational preamble or sign-off commentary.${glossaryPrompt}`;
+  // Enhanced literary web-novel prompt per Requirement 15
+  const systemInstruction = `You are a master literary translator specializing in Chinese web novels, xianxia, wuxia, and modern fiction.
+Translate the provided text from ${sourceLang} into natural, fluid, and immersive ${targetLang}.
 
-  try {
-    const response = await ai.models.generateContent({
+CORE RULES:
+1. Preserve complete meaning, emotional tone, nuances, and dialogue styles.
+2. Infer Chinese third-person pronouns (他/她/它) and implied subjects accurately from context to maintain gender consistency.
+3. Preserve original paragraph structure and dialogue breaks without merging or reordering.
+4. NEVER summarize, condense, or omit any sentences or paragraphs.
+5. NEVER add translator notes, conversational preambles, or sign-offs (e.g., do NOT output "Here is the translation:").
+6. Output ONLY the translated story text.${glossaryPrompt}`;
+
+  const callModel = async () => {
+    // Note: Do NOT add thinkingLevel: LOW (strictly prohibited by Requirement 14)
+    return await ai.models.generateContent({
       model,
       contents: text,
       config: {
@@ -72,19 +97,53 @@ DO NOT summarize or skip paragraphs. Output ONLY the translated story text witho
         temperature: 0.3,
       },
     });
+  };
 
-    // Check for safety finish reason
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(
+      () =>
+        reject(
+          new Error(
+            `Gemini translation request timed out after ${Math.round(
+              timeoutMs / 1000
+            )}s`
+          )
+        ),
+      timeoutMs
+    )
+  );
+
+  try {
+    const response: any = await Promise.race([callModel(), timeoutPromise]);
+
     const candidate = response.candidates?.[0];
     const finishReason = candidate?.finishReason;
 
-    if (finishReason && ['SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII'].includes(finishReason.toString())) {
-      throw new SafetyBlockError(`Gemini safety filter triggered with finishReason: ${finishReason}`);
+    // Check for safety finish reason
+    if (
+      finishReason &&
+      ['SAFETY', 'BLOCKLIST', 'PROHIBITED_CONTENT', 'SPII'].includes(
+        finishReason.toString()
+      )
+    ) {
+      throw new SafetyBlockError(
+        `Gemini safety filter triggered with finishReason: ${finishReason}`
+      );
+    }
+
+    // Check for truncation / MAX_TOKENS (Requirement 17)
+    if (finishReason === 'MAX_TOKENS') {
+      throw new TruncationError(
+        'Gemini response was truncated due to max output tokens.'
+      );
     }
 
     const output = response.text;
     if (!output || output.trim().length === 0) {
       if (candidate?.finishReason) {
-        throw new SafetyBlockError(`Gemini returned empty text with finishReason: ${candidate.finishReason}`);
+        throw new SafetyBlockError(
+          `Gemini returned empty text with finishReason: ${candidate.finishReason}`
+        );
       }
       throw new Error('Gemini returned an empty translation response');
     }
@@ -93,7 +152,7 @@ DO NOT summarize or skip paragraphs. Output ONLY the translated story text witho
   } catch (err: any) {
     const errMsg = err?.message || String(err);
 
-    // Detect safety block in error message
+    // Explicit Safety Block
     if (
       err instanceof SafetyBlockError ||
       /safety|blocked|harm_category|policy|sensitive/i.test(errMsg)
@@ -101,12 +160,17 @@ DO NOT summarize or skip paragraphs. Output ONLY the translated story text witho
       throw new SafetyBlockError(errMsg);
     }
 
-    // Detect rate limit / quota exhaustion
+    // Rate Limit / Quota Exhaustion
     if (
       err?.status === 429 ||
       /429|quota|rate limit|resource_exhausted/i.test(errMsg)
     ) {
-      throw new RateLimitError(errMsg);
+      let retryDelaySeconds: number | undefined;
+      const match = errMsg.match(/retry in ([\d\.]+)s/i) || errMsg.match(/retryDelay":"?(\d+)s/i);
+      if (match) {
+        retryDelaySeconds = Math.ceil(parseFloat(match[1]));
+      }
+      throw new RateLimitError(errMsg, retryDelaySeconds);
     }
 
     throw err;

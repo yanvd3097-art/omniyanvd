@@ -2,6 +2,7 @@ export interface ChapterSummary {
   index: number;
   title: string;
   wordCount: number;
+  subChunkCount?: number;
   preview: string;
 }
 
@@ -9,6 +10,8 @@ export interface ChapterDetail {
   index: number;
   title: string;
   status: 'pending' | 'translating' | 'completed' | 'failed' | 'fallback_google';
+  subChunkCount?: number;
+  completedSubChunks?: number;
   translatorUsed?: 'gemini' | 'google_translate';
   originalWordCount: number;
   translatedWordCount: number;
@@ -24,6 +27,9 @@ export interface JobStatus {
   targetLang: string;
   totalChapters: number;
   completedChapters: number;
+  contiguousCompletedChapters: number;
+  totalChunks: number;
+  completedChunks: number;
   totalOriginalWords: number;
   translatedWords: number;
   activeKeyIndex: number;
