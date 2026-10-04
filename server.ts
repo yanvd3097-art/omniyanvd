@@ -1,419 +1,408 @@
-import express, { Request, Response } from 'express';
-import dotenv from 'dotenv';
+import express from 'express';
+import multer from 'multer';
 import path from 'path';
-import { jobManager } from './server/services/jobManager.js';
-import { GoogleGenAI } from '@google/genai';
-
-dotenv.config();
+import fs from 'fs';
+import zlib from 'zlib';
+import { JobManager } from './src/server/jobManager.js';
+import { Store } from './src/server/store.js';
+import { TranslationScheduler } from './src/server/scheduler.js';
+import { generateContiguousEpub, generateContiguousTxt } from './src/server/epubGenerator.js';
+import { runAllAutomatedTests } from './src/server/tests.js';
 
 const app = express();
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = parseInt(process.env.PORT || '3000', 10);
+const isProd = process.env.NODE_ENV === 'production';
 
-// Enable large text uploads up to 50MB for raw novels
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
-
-// Default cache control
-app.use((req, res, next) => {
-  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-  next();
+// Configure multer for TXT file uploads (up to 50MB for 1M+ character novels)
+const upload = multer({
+  limits: { fileSize: 50 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
 });
 
-/**
- * 1. Upload & Prepare Novel API
- * Requirement 5: NEVER return rawChapters or full novel text back to the browser!
- */
-app.post('/api/parse-text', (req: Request, res: Response) => {
+app.use(express.json());
+
+// API Routes
+
+// 1A. Compressed TXT upload. The browser may gzip the source before transfer.
+// A hard decompressed-size limit prevents accidental oversized/zip-bomb input.
+app.post('/api/upload-compressed', express.raw({ type: 'application/octet-stream', limit: '55mb' }), async (req, res) => {
   try {
-    const { text, title, targetChunkChars } = req.body;
-    if (!text || typeof text !== 'string') {
-      res.status(400).json({ error: 'Novel text content is required' });
-      return;
+    const filename = decodeURIComponent(String(req.headers['x-omni-filename'] || 'novel.txt'));
+    if (!filename.toLowerCase().endsWith('.txt')) {
+      return res.status(400).json({ error: 'Only .txt files are supported.' });
+    }
+    const encoding = String(req.headers['x-omni-content-encoding'] || 'gzip').toLowerCase();
+    const body = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
+    if (!body.length) return res.status(400).json({ error: 'Compressed upload body is empty.' });
+
+    let decoded: Buffer;
+    if (encoding === 'gzip') {
+      decoded = zlib.gunzipSync(body);
+    } else if (encoding === 'br' || encoding === 'brotli') {
+      decoded = zlib.brotliDecompressSync(body);
+    } else {
+      return res.status(400).json({ error: 'Unsupported compression format.' });
+    }
+    if (decoded.length > 50 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Decompressed file exceeds the 50 MB limit.' });
     }
 
-    const prepared = jobManager.prepareNovel(
-      text,
-      title || 'Uploaded Novel',
-      targetChunkChars ? parseInt(targetChunkChars, 10) : 2500
-    );
+    let content = decoded.toString('utf-8');
+    if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
+    if (!content.trim()) return res.status(400).json({ error: 'The uploaded file is empty.' });
 
-    res.json({
-      success: true,
-      prepareId: prepared.prepareId,
-      title: prepared.title,
-      totalChapters: prepared.totalChapters,
-      totalOriginalWords: prepared.totalOriginalWords,
-      chapters: prepared.chapters, // Lightweight headers only!
-    });
+    const job = await JobManager.createJobFromText(filename, content);
+    res.json({ success: true, compressedUpload: true, originalBytes: decoded.length, compressedBytes: body.length, job });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to prepare novel' });
+    console.error('Compressed upload error:', err);
+    res.status(400).json({ error: err.message || 'Failed to decompress/process file' });
   }
 });
 
-/**
- * 2. Create Translation Job API
- * Takes prepareId, persists directly to Firestore, begins cloud translation.
- */
-app.post('/api/jobs', async (req: Request, res: Response) => {
+// 1. Upload TXT Novel
+app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
-    const {
-      prepareId,
-      title,
-      sourceLang,
-      targetLang,
-      model,
-      apiKeys,
-      glossary,
-      targetChunkChars,
-      telegramConfig,
-      autoStart,
-    } = req.body;
-
-    if (!prepareId) {
-      res.status(400).json({ error: 'prepareId is required' });
-      return;
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded. Please upload a .txt file.' });
     }
 
-    const job = await jobManager.createJob({
-      prepareId,
-      title,
-      sourceLang: sourceLang || 'Chinese',
-      targetLang: targetLang || 'English',
-      model: model || 'gemini-3.8-flash',
-      apiKeys: Array.isArray(apiKeys) ? apiKeys : [],
-      glossary: glossary || {},
-      targetChunkChars: targetChunkChars ? parseInt(targetChunkChars, 10) : 2500,
-      telegramConfig,
-      autoStart: autoStart !== false,
-    });
+    const filename = req.file.originalname || 'novel.txt';
+    // Decode Chinese text (UTF-8 or GB18030/GBK fallback)
+    let content = req.file.buffer.toString('utf-8');
 
-    const summary = jobManager.getJobStatusSummary(job.id);
-    res.json({ success: true, job: summary });
+    // Remove BOM if present
+    if (content.charCodeAt(0) === 0xfeff) {
+      content = content.slice(1);
+    }
+
+    if (!content.trim()) {
+      return res.status(400).json({ error: 'The uploaded file is empty.' });
+    }
+
+    const job = await JobManager.createJobFromText(filename, content);
+    res.json({ success: true, job });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to create translation job' });
+    console.error('Upload error:', err);
+    res.status(500).json({ error: err.message || 'Failed to process file' });
   }
 });
 
-/**
- * 3. List all jobs summary (Data-saving lightweight list)
- */
-app.get('/api/jobs', async (req: Request, res: Response) => {
+// 2. Start Translation
+app.post('/api/jobs/:id/start', async (req, res) => {
   try {
-    const jobs = await jobManager.getAllJobs();
-    const summaries = jobs.map(j => jobManager.getJobStatusSummary(j.id)).filter(Boolean);
-    res.json({ success: true, jobs: summaries });
+    const { id } = req.params;
+    const success = await JobManager.startJob(id);
+    if (!success) {
+      const keys = Store.getKeys();
+      if (keys.length === 0) {
+        return res.status(400).json({
+          error: 'No Gemini API keys configured. Please add at least one Gemini key in Settings.',
+        });
+      }
+      return res.status(400).json({ error: 'Failed to start translation job.' });
+    }
+    res.json({ success: true });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to get jobs' });
+    res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * 4. Lightweight status endpoint (~250-400 bytes)
- * Supports ETag / 304 Not Modified for maximum mobile data saving!
- * Also handles GET /api/cloud-job/status?jobId=...&summary=true
- */
-const handleStatusRequest = (req: Request, res: Response) => {
+// 3. Pause Translation
+app.post('/api/jobs/:id/pause', async (req, res) => {
   try {
-    const jobId = (req.params.id || req.query.jobId) as string;
-    if (!jobId) {
-      res.status(400).json({ error: 'jobId is required' });
-      return;
+    const { id } = req.params;
+    const success = await JobManager.pauseJob(id);
+    res.json({ success });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4. Resume Translation
+app.post('/api/jobs/:id/resume', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const success = await JobManager.resumeJob(id);
+    res.json({ success });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 4.1 Delete / Cancel Job
+app.delete('/api/jobs/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const success = await JobManager.deleteJob(id);
+    res.json({ success });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 5. Lightweight Status Polling (Mobile-Data Saving with ETag & 304 Not Modified)
+app.get('/api/jobs/:id/status', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const status = await Store.getJobStatus(id);
+    if (!status) {
+      return res.status(404).json({ error: 'Job not found' });
     }
 
-    const summary = jobManager.getJobStatusSummary(jobId);
-    if (!summary) {
-      res.status(404).json({ error: 'Job not found' });
-      return;
-    }
+    // Generate ETag based on completed count, status, exportable count, updatedAt
+    const etag = `"${status.id}-${status.status}-${status.completedChunks}-${status.exportableChapters}-${status.updatedAt}"`;
 
-    // ETag caching for zero mobile data consumption on unchanged status
-    const etag = `W/"${summary.id}-${summary.updatedAt}-${summary.completedChunks}"`;
     if (req.headers['if-none-match'] === etag) {
-      res.status(304).end();
-      return;
+      // Data hasn't changed -> save mobile data!
+      return res.status(304).end();
     }
 
     res.setHeader('ETag', etag);
-    res.json({ success: true, status: summary });
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Vary', 'Accept-Encoding');
+
+    // Status payloads are tiny, but Brotli makes the first/reopened status
+    // response even smaller on clients that advertise br support. 304 remains
+    // body-free, so unchanged polling consumes essentially only HTTP headers.
+    const statusJson = Buffer.from(JSON.stringify(status), 'utf-8');
+    const acceptEncoding = String(req.headers['accept-encoding'] || '').toLowerCase();
+    if (acceptEncoding.includes('br') && statusJson.length > 256) {
+      const compressed = zlib.brotliCompressSync(statusJson, {
+        params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 },
+      });
+      res.setHeader('Content-Encoding', 'br');
+      res.setHeader('Content-Length', compressed.length);
+      return res.end(compressed);
+    }
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Content-Length', statusJson.length);
+    return res.end(statusJson);
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to get status' });
+    res.status(500).json({ error: err.message });
   }
-};
+});
 
-app.get('/api/jobs/:id/status', handleStatusRequest);
-app.get('/api/cloud-job/status', handleStatusRequest);
-
-/**
- * 5. Job chapter list details (metadata headers only, NO full text)
- */
-app.get('/api/jobs/:id/details', async (req: Request, res: Response) => {
+// 6. List Recent Jobs
+app.get('/api/jobs', async (req, res) => {
   try {
-    const job = await jobManager.getJob(req.params.id);
+    const jobs = await Store.listJobs();
+    res.json(jobs);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// 7. Download Never-Skip EPUB (Current or Final)
+app.get('/api/jobs/:id/export/epub', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const job = await Store.getJob(id);
     if (!job) {
-      res.status(404).json({ error: 'Job not found' });
-      return;
+      return res.status(404).json({ error: 'Job not found' });
     }
 
-    const chapterHeaders = await jobManager.getChapterHeaders(req.params.id);
-
-    res.json({
-      success: true,
-      job: {
-        id: job.id,
-        title: job.title,
-        status: job.status,
-        sourceLang: job.sourceLang,
-        targetLang: job.targetLang,
-        model: job.model,
-        totalChapters: job.totalChapters,
-        completedChapters: job.completedChapters,
-        contiguousCompletedChapters: job.contiguousCompletedChapters,
-        totalChunks: job.totalChunks,
-        completedChunks: job.completedChunks,
-        totalOriginalWords: job.totalOriginalWords,
-        translatedWords: job.translatedWords,
-        activeKeyIndex: job.activeKeyIndex,
-        totalKeys: job.apiKeys.length,
-        hasEnvKey: !!process.env.GEMINI_API_KEY,
-        createdAt: job.createdAt,
-        updatedAt: job.updatedAt,
-        chapters: chapterHeaders,
-        glossary: job.glossary,
-        telegramConfig: job.telegramConfig,
-      },
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to get job details' });
-  }
-});
-
-/**
- * 6. Lazy-loaded Reader Chapter (Returns text for ONE chapter only)
- * Also handles GET /api/cloud-job/chapter/{chapterIndex}?jobId=...
- */
-const handleChapterRequest = async (req: Request, res: Response) => {
-  try {
-    const jobId = (req.params.id || req.query.jobId) as string;
-    const index = parseInt(req.params.index, 10);
-
-    if (!jobId || isNaN(index)) {
-      res.status(400).json({ error: 'jobId and chapter index are required' });
-      return;
+    const { buffer, chapterCount } = await generateContiguousEpub(id);
+    if (chapterCount === 0) {
+      return res.status(400).json({ error: 'No completed contiguous chapters are available yet.' });
     }
 
-    const chapter = await jobManager.getMergedChapter(jobId, index);
-    if (!chapter) {
-      res.status(404).json({ error: `Chapter ${index} not found` });
-      return;
-    }
-
-    res.json({ success: true, chapter });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to load chapter' });
-  }
-};
-
-app.get('/api/jobs/:id/chapter/:index', handleChapterRequest);
-app.get('/api/cloud-job/chapter/:index', handleChapterRequest);
-
-/**
- * 7. Start / Resume Job API
- */
-app.post('/api/jobs/:id/start', async (req: Request, res: Response) => {
-  try {
-    const ok = await jobManager.startJob(req.params.id);
-    if (!ok) {
-      res.status(404).json({ error: 'Job not found' });
-      return;
-    }
-    const summary = jobManager.getJobStatusSummary(req.params.id);
-    res.json({ success: true, status: summary });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to start job' });
-  }
-});
-
-/**
- * 8. Pause Job API
- */
-app.post('/api/jobs/:id/pause', async (req: Request, res: Response) => {
-  try {
-    const ok = await jobManager.pauseJob(req.params.id);
-    if (!ok) {
-      res.status(404).json({ error: 'Job not found' });
-      return;
-    }
-    const summary = jobManager.getJobStatusSummary(req.params.id);
-    res.json({ success: true, status: summary });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to pause job' });
-  }
-});
-
-/**
- * 9. Delete Job API
- */
-app.delete('/api/jobs/:id', async (req: Request, res: Response) => {
-  try {
-    const ok = await jobManager.deleteJob(req.params.id);
-    res.json({ success: ok });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to delete job' });
-  }
-});
-
-/**
- * 10. Update API Keys for Job
- */
-app.post('/api/jobs/:id/keys', async (req: Request, res: Response) => {
-  try {
-    const { keys } = req.body;
-    if (!Array.isArray(keys)) {
-      res.status(400).json({ error: 'Keys array required' });
-      return;
-    }
-    const ok = await jobManager.updateJobKeys(req.params.id, keys);
-    res.json({ success: ok });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Failed to update keys' });
-  }
-});
-
-/**
- * 11. Live EPUB Download (Contiguous Never-Skip output, does NOT stop background translation)
- */
-app.get('/api/jobs/:id/download/epub', async (req: Request, res: Response) => {
-  try {
-    const partial = req.query.partial !== 'false';
-    const job = await jobManager.getJob(req.params.id);
-    if (!job) {
-      res.status(404).send('Job not found');
-      return;
-    }
-
-    const epubBuffer = await jobManager.generateEpub(job.id, partial);
-    if (!epubBuffer) {
-      res.status(500).send('Failed to generate EPUB');
-      return;
-    }
-
-    const sanitizedTitle = (job.title || 'novel').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
-    const suffix = partial
-      ? `_ch1-${job.contiguousCompletedChapters || job.completedChapters}`
-      : '_full';
-    const filename = `${sanitizedTitle}${suffix}.epub`;
+    const safeTitle = (job.filename.replace(/\.txt$/i, '') || 'novel')
+      .replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
+    const downloadName = `${safeTitle}_Ch1-${chapterCount}.epub`;
 
     res.setHeader('Content-Type', 'application/epub+zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.setHeader('Content-Length', epubBuffer.length);
-    res.end(epubBuffer);
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`);
+    res.setHeader('Content-Length', buffer.length);
+    res.send(buffer);
   } catch (err: any) {
-    res.status(500).send('Error generating EPUB: ' + (err?.message || err));
+    console.error('EPUB Export error:', err);
+    res.status(500).json({ error: err.message || 'Failed to export EPUB' });
   }
 });
 
-/**
- * 12. TXT Download
- */
-app.get('/api/jobs/:id/download/txt', async (req: Request, res: Response) => {
+// 8. Download Never-Skip TXT (Current or Final)
+app.get('/api/jobs/:id/export/txt', async (req, res) => {
   try {
-    const partial = req.query.partial !== 'false';
-    const job = await jobManager.getJob(req.params.id);
+    const { id } = req.params;
+    const job = await Store.getJob(id);
     if (!job) {
-      res.status(404).send('Job not found');
-      return;
+      return res.status(404).json({ error: 'Job not found' });
     }
 
-    const txtContent = await jobManager.generateTxt(job.id, partial);
-    if (!txtContent) {
-      res.status(500).send('Failed to export TXT');
-      return;
+    const { text, chapterCount } = await generateContiguousTxt(id);
+    if (chapterCount === 0) {
+      return res.status(400).json({ error: 'No completed contiguous chapters are available yet.' });
     }
 
-    const sanitizedTitle = (job.title || 'novel').replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
-    const suffix = partial
-      ? `_ch1-${job.contiguousCompletedChapters || job.completedChapters}`
-      : '_full';
-    const filename = `${sanitizedTitle}${suffix}.txt`;
+    const safeTitle = (job.filename.replace(/\.txt$/i, '') || 'novel')
+      .replace(/[^a-zA-Z0-9_\-\u4e00-\u9fa5]/g, '_');
+    const downloadName = `${safeTitle}_Ch1-${chapterCount}.txt`;
+
+    const plain = Buffer.from(text, 'utf-8');
+    const acceptEncoding = String(req.headers['accept-encoding'] || '').toLowerCase();
+    let compressed: Buffer;
+    let contentEncoding: 'br' | 'gzip';
+
+    // Prefer Brotli for TXT because it normally produces a smaller transfer than gzip.
+    // Fall back to gzip for clients without Brotli support. EPUB is already a ZIP and
+    // is therefore intentionally not wrapped in another compression layer.
+    if (acceptEncoding.includes('br')) {
+      compressed = zlib.brotliCompressSync(plain, {
+        params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+      });
+      contentEncoding = 'br';
+    } else {
+      compressed = zlib.gzipSync(plain, { level: 6 });
+      contentEncoding = 'gzip';
+    }
 
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(filename)}"`);
-    res.send(txtContent);
+    res.setHeader('Content-Encoding', contentEncoding);
+    res.setHeader('Vary', 'Accept-Encoding');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`);
+    res.setHeader('Content-Length', compressed.length);
+    res.send(compressed);
   } catch (err: any) {
-    res.status(500).send('Error generating TXT: ' + (err?.message || err));
+    console.error('TXT Export error:', err);
+    res.status(500).json({ error: err.message || 'Failed to export TXT' });
   }
 });
 
-/**
- * 13. Test API Keys Connectivity (Zero prompt waste)
- */
-app.post('/api/test-keys', async (req: Request, res: Response) => {
+import { sendTelegramTest } from './src/server/telegram.js';
+import { testGeminiApiKey } from './src/server/geminiTranslator.js';
+
+// 9. Get Configured Keys
+app.get('/api/keys', (req, res) => {
+  const keys = Store.getKeys();
+  const masked = keys.map((k, index) => {
+    if (k.length <= 8) return `Key ${index + 1} (••••••••)`;
+    return `${k.slice(0, 4)}••••••••${k.slice(-4)}`;
+  });
+  res.json({
+    count: keys.length,
+    keys: masked,
+    rawKeys: keys,
+  });
+});
+
+// 10. Update Configured Keys (Up to 5)
+app.post('/api/keys', (req, res) => {
+  const { keys } = req.body;
+  if (!Array.isArray(keys)) {
+    return res.status(400).json({ error: 'keys must be an array of strings' });
+  }
+  const validKeys = keys.filter((k) => typeof k === 'string' && k.trim().length > 0).slice(0, 5);
+  Store.saveKeys(validKeys);
+  TranslationScheduler.getInstance().refreshKeys(true);
+  res.json({ success: true, count: validKeys.length });
+});
+
+// 10.1 Test Keys Connectivity
+app.post('/api/test-keys', async (req, res) => {
   try {
     const { keys } = req.body;
     if (!Array.isArray(keys)) {
-      res.status(400).json({ error: 'keys must be an array' });
-      return;
+      return res.status(400).json({ success: false, error: 'keys must be an array' });
     }
-
     const results = await Promise.all(
-      keys.map(async (key: string, idx: number) => {
-        const cleanKey = (key || '').trim();
-        if (!cleanKey) return { index: idx, status: 'empty', message: 'Empty key' };
-
-        try {
-          const ai = new GoogleGenAI({
-            apiKey: cleanKey,
-            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-          });
-          await ai.models.generateContent({
-            model: 'gemini-3.8-flash',
-            contents: 'ping',
-            config: { maxOutputTokens: 5 },
-          });
-          return {
-            index: idx,
-            status: 'valid',
-            prefix: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
-            message: 'Active & responding',
-          };
-        } catch (err: any) {
-          const msg = err?.message || String(err);
-          const is429 = /quota|429|resource_exhausted/i.test(msg);
-          return {
-            index: idx,
-            status: is429 ? 'rate_limited' : 'invalid',
-            prefix: cleanKey.slice(0, 4) + '...' + cleanKey.slice(-4),
-            message: msg.slice(0, 100),
-          };
-        }
+      keys.map(async (key: string, index: number) => {
+        const prefix = key.length > 8 ? `${key.slice(0, 4)}...${key.slice(-4)}` : `Key #${index + 1}`;
+        const testRes = await testGeminiApiKey(key);
+        return {
+          index,
+          prefix,
+          status: testRes.status,
+          message: testRes.message,
+        };
       })
     );
-
     res.json({ success: true, results });
   } catch (err: any) {
-    res.status(500).json({ error: err.message || 'Key test failed' });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Setup Vite middleware for dev or static serving for prod
-async function startServer() {
-  if (process.env.NODE_ENV === 'production') {
-    app.use(express.static(path.resolve(process.cwd(), 'dist')));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(process.cwd(), 'dist/index.html'));
-    });
-  } else {
+// 11. Get Telegram Notification Settings
+app.get('/api/telegram', (req, res) => {
+  const settings = Store.getTelegramSettings();
+  res.json(settings);
+});
+
+// 12. Save Telegram Notification Settings
+app.post('/api/telegram', (req, res) => {
+  const { botToken, chatIds, notifyStart, notifyProgress, notifyComplete, notifyPause, notifyResume, notifyError, notifyWaiting } = req.body;
+  const ids = Array.isArray(chatIds)
+    ? chatIds
+    : typeof chatIds === 'string'
+    ? chatIds.split(/[\s,;]+/).filter(Boolean)
+    : [];
+
+  Store.saveTelegramSettings({
+    botToken: botToken || '',
+    chatIds: ids.slice(0, 2),
+    notifyStart: notifyStart !== false,
+    notifyProgress: notifyProgress !== false,
+    notifyComplete: notifyComplete !== false,
+    notifyPause: notifyPause !== false,
+    notifyResume: notifyResume !== false,
+    notifyError: notifyError !== false,
+    notifyWaiting: notifyWaiting !== false,
+  });
+
+  res.json({ success: true, settings: Store.getTelegramSettings() });
+});
+
+// 13. Test Telegram Notification Connection
+app.post('/api/telegram/test', async (req, res) => {
+  try {
+    const { botToken, chatIds } = req.body;
+    const ids = Array.isArray(chatIds)
+      ? chatIds
+      : typeof chatIds === 'string'
+      ? chatIds.split(/[\s,;]+/).filter(Boolean)
+      : [];
+
+    const result = await sendTelegramTest(botToken || '', ids);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ success: false, message: err.message || 'Test failed' });
+  }
+});
+
+// 11. Run Automated Test Suite
+app.post('/api/test/run', async (req, res) => {
+  try {
+    const results = await runAllAutomatedTests();
+    res.json(results);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start dev or production server
+async function bootstrap() {
+  if (!isProd) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
     app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.resolve(process.cwd(), 'dist')));
+    app.get('*', (req, res) => {
+      res.sendFile(path.resolve(process.cwd(), 'dist', 'index.html'));
+    });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`MegaTXT Lite server running at http://0.0.0.0:${PORT}`);
+  app.listen(PORT, '0.0.0.0', async () => {
+    console.log(`[Omni Translator] Server running on http://0.0.0.0:${PORT}`);
+    // Recover any interrupted jobs from previous run (Crash/restart recovery)
+    await TranslationScheduler.getInstance().recoverOnStartup();
   });
 }
 
-startServer();
+bootstrap().catch((err) => {
+  console.error('[Omni Translator] Bootstrap failed:', err);
+  process.exit(1);
+});

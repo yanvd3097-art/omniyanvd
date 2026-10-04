@@ -1,0 +1,11 @@
+{
+  "botToken": "",
+  "chatIds": [],
+  "notifyStart": true,
+  "notifyProgress": true,
+  "notifyComplete": true,
+  "notifyPause": true,
+  "notifyResume": true,
+  "notifyError": true,
+  "notifyWaiting": true
+}

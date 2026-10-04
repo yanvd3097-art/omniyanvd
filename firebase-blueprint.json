@@ -1,57 +1,54 @@
 {
   "entities": {
-    "TranslationJob": {
+    "job": {
       "title": "TranslationJob",
-      "description": "Represents a novel translation job",
+      "description": "Represents an Omni Translator novel translation job.",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
-        "title": { "type": "string" },
-        "sourceLang": { "type": "string" },
-        "targetLang": { "type": "string" },
-        "model": { "type": "string" },
-        "status": { "type": "string", "enum": ["idle", "running", "paused", "completed", "error"] },
+        "filename": { "type": "string" },
         "totalChapters": { "type": "number" },
-        "completedChapters": { "type": "number" },
-        "totalOriginalWords": { "type": "number" },
-        "translatedWords": { "type": "number" },
-        "activeKeyIndex": { "type": "number" },
-        "totalKeys": { "type": "number" },
+        "totalChunks": { "type": "number" },
+        "completedChunks": { "type": "number" },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "translating", "paused", "completed", "failed"]
+        },
         "createdAt": { "type": "number" },
-        "updatedAt": { "type": "number" },
-        "contentHash": { "type": "string" }
+        "updatedAt": { "type": "number" }
       },
-      "required": ["id", "title", "status", "totalChapters", "completedChapters"]
+      "required": ["id", "filename", "totalChapters", "totalChunks", "completedChunks", "status", "createdAt", "updatedAt"]
     },
-    "TranslationChunk": {
+    "chunk": {
       "title": "TranslationChunk",
-      "description": "Represents an internal subchunk of a chapter",
+      "description": "Represents an individual text chunk within a chapter.",
       "type": "object",
       "properties": {
         "id": { "type": "string" },
         "jobId": { "type": "string" },
-        "parentChapterId": { "type": "string" },
-        "parentChapterIndex": { "type": "number" },
-        "parentChapterTitle": { "type": "string" },
-        "subChunkIndex": { "type": "number" },
-        "sourceText": { "type": "string" },
-        "status": { "type": "string", "enum": ["pending", "translating", "completed", "failed", "fallback_google"] },
-        "englishText": { "type": "string" },
-        "translatedWordCount": { "type": "number" },
-        "translatorUsed": { "type": "string" },
+        "chapterIndex": { "type": "number" },
+        "chunkIndex": { "type": "number" },
+        "originalText": { "type": "string" },
+        "translatedText": { "type": "string" },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "translating", "completed", "failed"]
+        },
+        "claimedBy": { "type": "string" },
+        "leaseExpiresAt": { "type": "number" },
         "updatedAt": { "type": "number" }
       },
-      "required": ["id", "jobId", "parentChapterIndex", "subChunkIndex", "status"]
+      "required": ["id", "jobId", "chapterIndex", "chunkIndex", "originalText", "status", "updatedAt"]
     }
   },
   "firestore": {
-    "/translation_jobs/{jobId}": {
-      "schema": "TranslationJob",
-      "description": "Durable translation jobs"
+    "/jobs/{jobId}": {
+      "schema": "job",
+      "description": "Collection of translation jobs"
     },
-    "/translation_jobs/{jobId}/chunks/{chunkId}": {
-      "schema": "TranslationChunk",
-      "description": "Durable chapter subchunks"
+    "/jobs/{jobId}/chunks/{chunkId}": {
+      "schema": "chunk",
+      "description": "Subcollection of chunks for a given job"
     }
   }
 }
