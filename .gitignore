@@ -1,0 +1,11 @@
+node_modules/
+build/
+dist/
+coverage/
+data/
+*.zip
+*.epub
+.DS_Store
+*.log
+.env*
+!.env.example

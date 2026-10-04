@@ -1,0 +1,6 @@
+{
+  "name": "MegaTXT Lite - Background Novel Translator",
+  "description": "Ultra-lightweight, mobile data-saving novel and text translator with cloud background translation, multi-key Gemini rotation, sensitive chapter auto-fallback, and live EPUB generation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
